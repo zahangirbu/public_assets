@@ -311,15 +311,16 @@
 #${WID} .nx-info p{margin:0 0 6px}#${WID} .nx-info p:last-child{margin:0}
 
 /* Conversation */
-#${WID} .nx-cv{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;background:#fff}
+#${WID} .nx-cv{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#fff}
 
 /* Messages — row layout with avatar beside bubble */
 #${WID} .nx-mw{display:flex;gap:8px;max-width:92%;animation:nx-msg-l .25s ease}
 #${WID} .nx-mw-a{align-self:flex-start;align-items:flex-start}
 #${WID} .nx-mw-u{align-self:flex-end;flex-direction:row-reverse;animation:nx-msg-r .25s ease}
-#${WID} .nx-m{border-radius:16px;word-wrap:break-word;position:relative;flex:1;min-width:0}
-#${WID} .nx-m-u{background:${ac};color:#fff;border-bottom-right-radius:4px;padding:10px 14px}
-#${WID} .nx-m-a{background:#f0f0f0;color:#2D2926;border-bottom-left-radius:4px;padding:10px 14px}
+#${WID} .nx-col{display:flex;flex-direction:column;flex:1;min-width:0}
+#${WID} .nx-m{border-radius:16px;word-wrap:break-word;position:relative}
+#${WID} .nx-m-u{background:${ac};color:#fff;border-bottom-right-radius:4px;padding:8px 12px}
+#${WID} .nx-m-a{background:#f0f0f0;color:#2D2926;border-bottom-left-radius:4px;padding:8px 12px}
 #${WID} .nx-m-t{animation:nx-msg-l .2s ease}
 #${WID} .nx-m-s{animation:nx-msg-l .2s ease}
 #${WID} .nx-m-a .nx-mc{white-space:normal}
@@ -354,12 +355,12 @@
 #${WID} .nx-typing-dot:nth-child(2){animation-delay:-.16s}
 
 /* Timestamp */
-#${WID} .nx-ts{font-size:10px;color:#767676;margin-top:2px;opacity:0;transition:opacity .15s;user-select:none}
-#${WID} .nx-mw:hover .nx-ts,#${WID} .nx-m:hover .nx-ts{opacity:1}
+#${WID} .nx-ts{font-size:10px;color:#767676;margin-top:2px;visibility:hidden;user-select:none}
+#${WID} .nx-mw:hover .nx-ts{visibility:visible}
 
 /* Message actions (copy, feedback) */
-#${WID} .nx-ma{display:flex;gap:4px;margin-top:4px;opacity:0;transition:opacity .15s}
-#${WID} .nx-mw:hover .nx-ma{opacity:1}
+#${WID} .nx-ma{display:flex;gap:4px;margin-top:2px;visibility:hidden}
+#${WID} .nx-mw:hover .nx-ma{visibility:visible}
 #${WID} .nx-ma button{background:none;border:none;cursor:pointer;padding:2px 4px;border-radius:4px;color:#767676;font-size:12px;display:flex;align-items:center;gap:3px;transition:color .15s,background .15s}
 #${WID} .nx-ma button:hover{background:#e8e8e8;color:#333}
 #${WID} .nx-ma button.nx-voted{color:${ac}}
@@ -519,7 +520,7 @@
     if (C.greeting) { const g = document.createElement('div'); g.className = 'nx-gr'; g.textContent = C.greeting; inner.appendChild(g); }
     if (C.samplePrompts && C.samplePrompts.length) {
       const s = document.createElement('div'); s.className = 'nx-sp';
-      C.samplePrompts.forEach((p, i) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'nx-spb'; b.style.animationDelay = (i * 80) + 'ms'; b.textContent = p; b.addEventListener('click', () => { inp.value = p; sendMsg(); }); s.appendChild(b); });
+      C.samplePrompts.forEach((p, i) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'nx-spb'; b.style.animationDelay = (i * 80) + 'ms'; b.textContent = p; b.addEventListener('click', (e) => { e.stopPropagation(); sendMsg(p); }); s.appendChild(b); });
       inner.appendChild(s);
     }
     w.appendChild(inner);
@@ -668,10 +669,13 @@
       const av = document.createElement('div'); av.className = 'nx-av'; av.innerHTML = '<img src="' + getAvatarSrc() + '" alt="BU">';
       wrap.appendChild(av);
 
+      // Column: bubble + meta below
+      const col = document.createElement('div'); col.className = 'nx-col';
       const mc = document.createElement('div'); mc.className = 'nx-mc'; mc.innerHTML = md(text || ''); el.appendChild(mc);
-      const ts = document.createElement('div'); ts.className = 'nx-ts'; ts.textContent = 'just now'; el.appendChild(ts);
+      col.appendChild(el);
+      const ts = document.createElement('div'); ts.className = 'nx-ts'; ts.textContent = 'just now'; col.appendChild(ts);
 
-      // Actions bar
+      // Actions bar — outside bubble, inside column
       const ma = document.createElement('div'); ma.className = 'nx-ma';
       const cpBtn = document.createElement('button'); cpBtn.type = 'button'; cpBtn.title = 'Copy'; cpBtn.setAttribute('aria-label', 'Copy message');
       cpBtn.innerHTML = ic.copy + ' Copy';
@@ -684,7 +688,8 @@
       upBtn.innerHTML = ic.thumbUp;
       function showCommentField(rating) {
         // Remove existing comment field if any
-        const existing = el.querySelector('.nx-fb-comment');
+        const parent = el.closest('.nx-col') || el;
+        const existing = parent.querySelector('.nx-fb-comment');
         if (existing) existing.remove();
         const row = document.createElement('div'); row.className = 'nx-fb-comment';
         const input = document.createElement('input'); input.type = 'text'; input.className = 'nx-fb-input';
@@ -695,7 +700,7 @@
         sendLink.addEventListener('click', submit);
         input.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
         row.appendChild(input); row.appendChild(sendLink);
-        el.appendChild(row);
+        parent.appendChild(row);
         input.focus();
       }
       upBtn.addEventListener('click', () => {
@@ -712,18 +717,21 @@
         showCommentField('negative');
       });
       ma.appendChild(downBtn);
-      el.appendChild(ma);
+      col.appendChild(ma);
 
-      wrap.appendChild(el);
+      wrap.appendChild(col);
     } else if (role === 'user') {
+      // Column: bubble + timestamp below
+      const col = document.createElement('div'); col.className = 'nx-col';
       el.textContent = text || '';
-      const ts = document.createElement('div'); ts.className = 'nx-ts'; ts.textContent = 'just now'; el.appendChild(ts);
-      wrap.appendChild(el);
+      col.appendChild(el);
+      const ts = document.createElement('div'); ts.className = 'nx-ts'; ts.textContent = 'just now'; col.appendChild(ts);
+      wrap.appendChild(col);
 
       // User avatar (gender-neutral silhouette) — appended after bubble,
       // row-reverse puts it on the right visually
       const uav = document.createElement('div'); uav.className = 'nx-av-u'; uav.setAttribute('aria-hidden', 'true'); uav.innerHTML = ic.person;
-      wrap.insertBefore(uav, el);
+      wrap.insertBefore(uav, col);
     } else {
       // system/tool messages — no wrapper, just the element
       el.textContent = text || '';
@@ -816,20 +824,38 @@
     return currentToolGroup;
   }
 
-  function addToolLine(text) {
+  let toolLineMap = {}; // tool_call_id → DOM element
+
+  function addToolStart(text, toolCallId) {
     const g = getToolGroup();
     toolCount++;
-    g.label.textContent = 'Using tools\u2026 (' + toolCount + ')';
+    g.label.textContent = toolCount === 1 ? 'Searching\u2026' : 'Searching (' + toolCount + ' sources)\u2026';
     const line = document.createElement('div'); line.className = 'nx-tc-line'; line.textContent = text;
     g.body.appendChild(line);
+    if (toolCallId) toolLineMap[toolCallId] = line;
     cv.lastElementChild && cv.lastElementChild.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }
+
+  function addToolResult(text, toolCallId) {
+    // Append result to the matching tool start line
+    const startLine = toolCallId && toolLineMap[toolCallId];
+    if (startLine) {
+      const result = document.createElement('span');
+      result.style.cssText = 'margin-left:6px;color:#767676;font-size:11px;';
+      result.textContent = text;
+      startLine.appendChild(result);
+    } else {
+      const g = getToolGroup();
+      const line = document.createElement('div'); line.className = 'nx-tc-line'; line.textContent = text;
+      g.body.appendChild(line);
+    }
   }
 
   function finishToolGroup() {
     if (!currentToolGroup) return;
     currentToolGroup.wrap.classList.add('nx-done');
-    currentToolGroup.label.textContent = 'Used ' + toolCount + ' tool' + (toolCount !== 1 ? 's' : '');
-    currentToolGroup = null; toolCount = 0;
+    currentToolGroup.label.textContent = toolCount === 1 ? 'Searched 1 source' : 'Searched ' + toolCount + ' sources';
+    currentToolGroup = null; toolCount = 0; toolLineMap = {};
   }
 
   // Update timestamps periodically
@@ -903,8 +929,14 @@
       case 'message_start': if (d.conversation_id) { convId = d.conversation_id; try { sessionStorage.setItem(STORE_KEY, convId); } catch (_) {} } break;
       case 'content_delta': if (typeof d.text === 'string') H.delta(d.text); break;
       case 'round_break': H.brk(); break;
-      case 'tool_call_start': H.tool('\u2192 ' + (d.tool_name || '?')); break;
-      case 'tool_result': { const p = typeof d.result === 'string' ? (d.result.length > 200 ? d.result.slice(0, 200) + '\u2026' : d.result) : JSON.stringify(d.result); H.tool((d.is_error ? '\u2717 ' : '\u2190 ') + p); } break;
+      case 'tool_call_start': {
+        const friendly = (d.tool_name || '?').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        H.toolStart('Searching: ' + friendly, d.tool_call_id);
+      } break;
+      case 'tool_result': {
+        if (d.is_error) H.toolResult('\u2717 Error', d.tool_call_id);
+        else H.toolResult('\u2713', d.tool_call_id);
+      } break;
       case 'message_end': H.end(); break;
       case 'auth_required': H.auth(d || {}); break;
       case 'error': H.err(new Error((d && d.message) || 'Server error')); break;
@@ -948,7 +980,8 @@
         if (!gotContent) { removeTyping(); finishToolGroup(); respEl = addMsg('assistant', ''); respEl.classList.add('nx-str'); gotContent = true; }
         appTo(respEl, chunk);
       },
-      tool: (label) => { if (C.showToolEvents) addToolLine(label); },
+      toolStart: (label, id) => { if (C.showToolEvents) addToolStart(label, id); },
+      toolResult: (label, id) => { if (C.showToolEvents) addToolResult(label, id); },
       brk: () => { finishToolGroup(); addBrk(); },
       end: () => finish(),
       err: (e) => {
@@ -958,12 +991,27 @@
       },
       auth: (p) => {
         removeTyping();
-        if (!gotContent) { respEl = addMsg('assistant', ''); gotContent = true; }
-        if (haEnabled()) { handleHostAuth(respEl, finish); return; }
-        const mc = respEl.querySelector('.nx-mc');
-        if (mc) mc.innerHTML = md(p.message || 'Please sign in to continue.');
-        renderAuth(respEl, p);
-        finish();
+        // Collect elements to remove on successful auth: preamble, tool group, user message
+        const toRemove = [];
+        if (currentToolGroup) { toRemove.push(currentToolGroup.wrap); currentToolGroup = null; toolCount = 0; }
+        if (gotContent && respEl) { toRemove.push(respEl._wrap || respEl); }
+        // Also remove the user message that triggered this (retry will re-add it)
+        const userBubbles = cv.querySelectorAll('.nx-mw-u');
+        if (userBubbles.length > 0) toRemove.push(userBubbles[userBubbles.length - 1]);
+
+        gotContent = false; respEl = null;
+        // Create a clean system-style auth message
+        const authEl = addMsg('system', p.message || 'Please sign in to continue.');
+        // Mark as done so retry can proceed
+        settled = true; busy = false; snb.disabled = false;
+
+        if (haEnabled()) { handleHostAuth(authEl, () => {}); return; }
+
+        // After successful auth, remove everything (auth msg + login button + preamble + user msg)
+        renderAuth(authEl, p, () => {
+          authEl.remove();
+          toRemove.forEach(el => { if (el && el.parentNode) el.remove(); });
+        });
       },
     });
   }
@@ -975,24 +1023,25 @@
     else appTo(el, ' [error] ' + (r.error || 'failed'));
   }
 
-  function renderAuth(el, p) {
+  function renderAuth(el, p, onAuthSuccess) {
     const sOk = C.allowMsalFallback && C.msal.clientId && C.msal.authority;
     const pOk = C.allowMsalPopupLogin && C.msal.clientId && C.msal.authority;
     const lk = document.createElement('span'); lk.className = 'nx-al'; lk.setAttribute('role', 'button'); lk.textContent = p.label || 'Sign in with BU Login';
     const nt = document.createElement('span'); nt.className = 'nx-an'; nt.textContent = sOk ? 'Will try silent first.' : pOk ? 'Opens a popup.' : 'MSAL not configured.';
     el.appendChild(document.createElement('br')); el.appendChild(lk); el.appendChild(nt);
     let ph = sOk && pOk ? 'sf' : sOk ? 'so' : pOk ? 'po' : 'x';
+    function afterLogin() { if (onAuthSuccess) onAuthSuccess(); if (C.autoRetryAfterAuth && lastQ) setTimeout(() => sendMsg(lastQ), 150); }
     const go = async () => {
       if (lk.classList.contains('nx-bsy')) return;
       lk.classList.add('nx-bsy');
       if (ph === 'sf' || ph === 'so') {
         lk.textContent = 'Signing in\u2026';
-        try { await silentAuth(); lk.textContent = 'Signed in \u2713'; if (C.autoRetryAfterAuth && lastQ) setTimeout(() => sendMsg(lastQ), 150); return; }
+        try { await silentAuth(); lk.textContent = 'Signed in \u2713'; afterLogin(); return; }
         catch (_) { if (ph === 'sf') { ph = 'po'; lk.classList.remove('nx-bsy'); lk.textContent = 'Sign in with BU Login'; nt.textContent = 'Silent failed. Click for popup.'; return; } lk.classList.remove('nx-bsy'); lk.textContent = 'Retry'; return; }
       }
       if (ph === 'po') {
         lk.textContent = 'Opening\u2026';
-        try { await popupAuth(); lk.textContent = 'Signed in \u2713'; if (C.autoRetryAfterAuth && lastQ) setTimeout(() => sendMsg(lastQ), 150); }
+        try { await popupAuth(); lk.textContent = 'Signed in \u2713'; afterLogin(); }
         catch (e) { lk.classList.remove('nx-bsy'); lk.textContent = 'Sign in with BU Login'; nt.textContent = 'Failed: ' + (e.message || e); }
       }
     };
