@@ -389,7 +389,11 @@
 #${WID} .nx-in-wrap:focus-within{border-color:${ac};box-shadow:0 0 0 2px ${ac}22}
 #${WID} .nx-mic{background:none;border:none;cursor:pointer;padding:8px 4px 8px 10px;color:#767676;display:flex;align-items:center;flex-shrink:0;transition:color .15s}
 #${WID} .nx-mic:hover{color:#2D2926}
+#${WID} .nx-mic:disabled{cursor:not-allowed;opacity:.4}
+#${WID} .nx-mic:disabled:hover{color:#767676}
 #${WID} .nx-mic.nx-mic-on{color:${ac};animation:nx-pulse 1.5s infinite}
+#${WID} .nx-mic.nx-mic-loading{cursor:progress;color:#767676;animation:nx-pulse 2s infinite}
+#${WID} .nx-mic.nx-mic-busy{cursor:wait;color:${ac};opacity:.7}
 #${WID} .nx-mic svg{width:16px;height:16px}
 #${WID} .nx-mic.nx-mic-hide{display:none}
 #${WID} .nx-in{flex:1;resize:none;border:none;border-radius:0;padding:10px 14px 10px 4px;font-family:inherit;font-size:14px;height:44px;max-height:120px;outline:none;box-sizing:border-box;background:transparent}
@@ -477,9 +481,10 @@
     <div class="nx-cv" role="log" aria-live="polite" aria-label="Chat messages"></div>
     <div class="nx-ia">
       <div class="nx-in-wrap">
-        <!-- Voice dictation button (commented out — requires HTTPS + speech service access)
-        <button type="button" class="nx-mic" title="Voice input" aria-label="Start voice dictation">${ic.mic}</button>
-        -->
+        <!-- Voice dictation button. Wired up by the VOICE INPUT block
+             below (transformers.js + Whisper). Hidden automatically on
+             browsers without MediaRecorder/getUserMedia. -->
+        <button type="button" class="nx-mic" title="Voice input" aria-label="Voice input">${ic.mic}</button>
         <textarea class="nx-in" id="nx-chat-input" name="nx-chat-input" rows="1" placeholder="${esc(C.placeholder)}" aria-label="Chat message input" autocomplete="off"></textarea>
       </div>
       <button type="button" class="nx-sn" title="Send" aria-label="Send message">${ic.send}</button>
@@ -982,7 +987,12 @@
       },
       toolStart: (label, id) => { if (C.showToolEvents) addToolStart(label, id); },
       toolResult: (label, id) => { if (C.showToolEvents) addToolResult(label, id); },
-      brk: () => { finishToolGroup(); addBrk(); },
+      brk: () => {
+        finishToolGroup();
+        // Close current bubble so post-tool content gets a fresh one
+        if (respEl) { respEl.classList.remove('nx-str'); finishMsg(respEl); }
+        respEl = null; gotContent = false;
+      },
       end: () => finish(),
       err: (e) => {
         if (!gotContent) { removeTyping(); respEl = addMsg('assistant', ''); gotContent = true; }
@@ -1056,57 +1066,274 @@
   inp.addEventListener('input', () => { inp.style.height = '44px'; inp.style.height = Math.min(inp.scrollHeight, 120) + 'px'; });
   if (launcher) launcher.addEventListener('click', toggle);
 
-  // ── Voice dictation (Web Speech API) ──────────────────────
-  // Commented out — requires HTTPS + working speech service.
-  // Uncomment when deploying to production with valid certs.
-  // See: https://developer.mozilla.org/en-US/docs/Web/API/SpeechRecognition
-  /*
+  // ═══════════════════════════════════════════════════════════════
+  // VOICE INPUT — transformers.js + Xenova/whisper-base.en (in-browser)
+  // ═══════════════════════════════════════════════════════════════
+  // Hold-to-talk dictation. The model (~150 MB of ONNX weights) is fetched
+  // from the HF CDN on first use and cached in IndexedDB by transformers.js;
+  // no audio leaves the browser. Inference runs on WebGPU when available
+  // and falls back to WASM.
+  //
+  // UX: press-and-hold the mic to record, release to transcribe + auto-send
+  // (the gesture implies commitment — the user kept their finger down). The
+  // button reuses chat.js's existing `.nx-mic` styles plus three additive
+  // state classes: `.nx-mic-loading` (model download), `.nx-mic-on` (live
+  // recording — same red pulse the input row already uses), and
+  // `.nx-mic-busy` (transcribing). No david-style emoji or class names —
+  // the SVG icon defined in `ic.mic` stays put.
+  //
+  // Browsers without `MediaRecorder` / `getUserMedia` (rare today) get the
+  // mic hidden via the existing `.nx-mic-hide` class.
   const micBtn = root.querySelector('.nx-mic');
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-  if (!SpeechRecognition) {
+  if (!micBtn) {
+    /* no mic button rendered — nothing to wire */
+  } else if (!navigator.mediaDevices || !window.MediaRecorder) {
     micBtn.classList.add('nx-mic-hide');
   } else {
-    let recognition = null;
-    let isListening = false;
+    const VOICE_MODEL = 'Xenova/whisper-base.en';
+    const VOICE_LIB   = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js';
 
-    micBtn.addEventListener('click', () => {
-      if (isListening) { recognition.stop(); return; }
+    // ── State ────────────────────────────────────────────────
+    // `recording` = MediaRecorder is active.
+    // `pressHeld` = the user's pointer is currently down on the button.
+    // We track them separately so a release during the async getUserMedia
+    // permission prompt cancels cleanly instead of leaving an orphan stream.
+    let transcriber = null;
+    let recording = false;
+    let pressHeld = false;
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let recordedChunks = [];
 
-      recognition = new SpeechRecognition();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
+    // Stable "home" for the input placeholder. onRecordingStop restores
+    // to this — never to a transient value (e.g. "Transcribing…")
+    // that a fast second press might capture.
+    let basePlaceholder = C.placeholder || '';
+    inp.placeholder = basePlaceholder;
 
-      const beforeText = inp.value;
-      let finalTranscript = '', hadFatalError = false;
+    // Original mic title for restore (chat.js's existing `Voice input`).
+    const baseTitle = micBtn.getAttribute('title') || 'Voice input';
 
-      recognition.onstart = () => { isListening = true; micBtn.classList.add('nx-mic-on'); inp.placeholder = 'Listening\u2026'; };
-      recognition.onresult = (event) => {
-        let interim = ''; finalTranscript = '';
-        for (let i = 0; i < event.results.length; i++) {
-          if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
-          else interim += event.results[i][0].transcript;
+    /**
+     * Mic button state machine. All state classes flow through here so
+     * transitions are atomic — no chance of `nx-mic-on` and `nx-mic-busy`
+     * coexisting on a race. Only the additive nx-mic-* classes are
+     * touched; `.nx-mic` itself and the SVG icon are preserved.
+     *
+     * @param {'idle'|'loading'|'listening'|'busy'|'error'|'unavailable'} state
+     * @param {string} [title] tooltip override
+     */
+    function setMicState(state, title) {
+      micBtn.classList.remove('nx-mic-on', 'nx-mic-loading', 'nx-mic-busy', 'nx-mic-hide');
+      let disabled = false;
+      let resolvedTitle = title;
+      switch (state) {
+        case 'loading':
+          micBtn.classList.add('nx-mic-loading');
+          disabled = true;
+          if (resolvedTitle === undefined) resolvedTitle = 'Loading voice model…';
+          break;
+        case 'listening':
+          micBtn.classList.add('nx-mic-on');
+          if (resolvedTitle === undefined) resolvedTitle = 'Listening — release to send';
+          break;
+        case 'busy':
+          micBtn.classList.add('nx-mic-busy');
+          disabled = true;
+          if (resolvedTitle === undefined) resolvedTitle = 'Transcribing…';
+          break;
+        case 'unavailable':
+          micBtn.classList.add('nx-mic-hide');
+          disabled = true;
+          break;
+        case 'error':
+          disabled = true;
+          if (resolvedTitle === undefined) resolvedTitle = 'Voice input unavailable';
+          break;
+        case 'idle':
+        default:
+          if (resolvedTitle === undefined) resolvedTitle = 'Hold to talk';
+          break;
+      }
+      micBtn.disabled = disabled;
+      micBtn.setAttribute('title', resolvedTitle || baseTitle);
+      micBtn.setAttribute('aria-label', resolvedTitle || baseTitle);
+    }
+
+    /**
+     * Lazily pulls the transformers.js ESM bundle and instantiates the
+     * Whisper pipeline. Called once at startup. While the download runs
+     * the mic button stays in `loading` state and shows rough overall
+     * progress in its tooltip.
+     * @returns {Promise<void>}
+     */
+    async function loadVoiceModel() {
+      try {
+        setMicState('loading');
+        // Use the package's prebuilt ESM bundle. jsdelivr's `+esm` auto-
+        // transform rewrites imports in a way that breaks onnxruntime-web's
+        // backend registration (null.registerBackend) — go direct.
+        const { pipeline, env } = await import(VOICE_LIB);
+        env.allowLocalModels = false;   // hit HF CDN; rely on IndexedDB cache
+        // Aggregate per-file download progress into a single percentage.
+        const fileProgress = {};
+        const onProgress = (p) => {
+          if (p.status === 'progress' && p.file) {
+            fileProgress[p.file] = p.progress || 0;
+            const vals = Object.values(fileProgress);
+            const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+            setMicState('loading', 'Loading voice model… ' + Math.round(avg) + '%');
+          } else if (p.status === 'done') {
+            setMicState('loading', 'Loading voice model… finalizing');
+          }
+        };
+        transcriber = await pipeline(
+          'automatic-speech-recognition',
+          VOICE_MODEL,
+          { progress_callback: onProgress }
+        );
+        setMicState('idle');
+        try { console.log('[voice] model ready'); } catch (_) {}
+      } catch (err) {
+        try { console.error('[voice] model load failed:', err); } catch (_) {}
+        setMicState('error', 'Voice input unavailable (model failed to load)');
+      }
+    }
+
+    /**
+     * Decode the MediaRecorder blob, downmix to mono, resample to 16 kHz —
+     * the exact shape Whisper expects.
+     * @param {Blob} blob
+     * @returns {Promise<Float32Array>}
+     */
+    async function blobToFloat32_16kMono(blob) {
+      const arrayBuf = await blob.arrayBuffer();
+      const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const decoded = await tmpCtx.decodeAudioData(arrayBuf);
+      tmpCtx.close();
+
+      const target = 16000;
+      const offline = new OfflineAudioContext(
+        1,
+        Math.ceil(decoded.duration * target),
+        target
+      );
+      const src = offline.createBufferSource();
+      src.buffer = decoded;
+      src.connect(offline.destination);
+      src.start();
+      const rendered = await offline.startRendering();
+      return rendered.getChannelData(0);
+    }
+
+    /** Request mic permission and start a MediaRecorder session. */
+    async function startRecording() {
+      if (!transcriber || recording) return;
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (err) {
+        try { console.warn('[voice] mic permission denied:', err); } catch (_) {}
+        pressHeld = false;
+        setMicState('idle', 'Microphone blocked — check browser permissions');
+        return;
+      }
+      // The user may have released (or a second press may have already
+      // resolved) while the permission prompt was open. Bail cleanly.
+      if (!pressHeld || recording) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      mediaStream = stream;
+      recordedChunks = [];
+      mediaRecorder = new MediaRecorder(mediaStream);
+      mediaRecorder.addEventListener('dataavailable', (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      });
+      mediaRecorder.addEventListener('stop', onRecordingStop);
+      mediaRecorder.start();
+      recording = true;
+      setMicState('listening');
+    }
+
+    /** Stop the MediaRecorder; the `stop` event drives transcription. */
+    function stopRecording() {
+      if (!recording) return;
+      try { mediaRecorder.stop(); } catch (_) {}
+      try { mediaStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      recording = false;
+      setMicState('busy');
+    }
+
+    /**
+     * MediaRecorder `stop` handler. Assembles captured chunks, runs Whisper
+     * over them, and inserts the transcript into the input. Hold-to-talk
+     * implies intent, so we auto-submit on success.
+     */
+    async function onRecordingStop() {
+      inp.placeholder = 'Transcribing…';
+      try {
+        const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
+        if (blob.size >= 500) { // anything smaller is silence / no audio captured
+          const audio = await blobToFloat32_16kMono(blob);
+          const result = await transcriber(audio);
+          const text = (result && result.text ? result.text : '').trim();
+          if (text) {
+            inp.value = inp.value ? inp.value + ' ' + text : text;
+            // Match chat.js's input auto-resize behaviour after programmatic value change.
+            inp.style.height = '44px';
+            inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
+            inp.focus();
+            // Hold-to-talk implies commitment — auto-send on release.
+            sendMsg();
+          }
         }
-        inp.value = beforeText + finalTranscript + interim;
-        inp.style.height = '44px'; inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
-      };
-      recognition.onend = () => {
-        if (isListening && !hadFatalError) { try { recognition.start(); return; } catch (_) {} }
-        isListening = false; micBtn.classList.remove('nx-mic-on'); inp.placeholder = C.placeholder; inp.focus();
-      };
-      recognition.onerror = (event) => {
-        if (['not-allowed','service-not-allowed','network','audio-capture'].includes(event.error)) {
-          hadFatalError = true; isListening = false; micBtn.classList.remove('nx-mic-on');
-          inp.placeholder = event.error === 'network' ? 'Voice requires HTTPS' : 'Voice unavailable';
-          setTimeout(() => { inp.placeholder = C.placeholder; }, 3000);
-          if (event.error === 'network') micBtn.classList.add('nx-mic-hide');
-        }
-      };
-      recognition.start();
-    });
+        inp.placeholder = basePlaceholder;
+      } catch (err) {
+        try { console.error('[voice] transcription failed:', err); } catch (_) {}
+        inp.placeholder = 'Voice transcription failed';
+        setTimeout(() => {
+          if (inp.placeholder === 'Voice transcription failed') {
+            inp.placeholder = basePlaceholder;
+          }
+        }, 4000);
+      } finally {
+        setMicState('idle');
+      }
+    }
+
+    // ── Press-and-hold gesture handlers ─────────────────────
+    // Mouse + touch handled symmetrically. preventDefault() avoids the
+    // double-fire (focus + click) sequence on touch devices.
+    const pressStart = (e) => {
+      if (micBtn.disabled || recording || pressHeld) return;
+      e.preventDefault();
+      pressHeld = true;
+      startRecording();
+    };
+    const pressEnd = (e) => {
+      if (!pressHeld) return;
+      e.preventDefault();
+      pressHeld = false;
+      // If startRecording is still mid-permission-prompt, the `pressHeld`
+      // check inside it abandons the stream cleanly.
+      if (recording) stopRecording();
+    };
+    micBtn.addEventListener('mousedown', pressStart);
+    micBtn.addEventListener('touchstart', pressStart, { passive: false });
+    micBtn.addEventListener('mouseup', pressEnd);
+    micBtn.addEventListener('mouseleave', pressEnd);
+    micBtn.addEventListener('touchend', pressEnd);
+    micBtn.addEventListener('touchcancel', pressEnd);
+
+    // Eagerly start the model download so most of the ~150 MB transfer
+    // happens in the background while the user is still reading the page.
+    loadVoiceModel();
   }
-  */
+  // ═══════════════════════════════════════════════════════════════
+  // END VOICE INPUT
+  // ═══════════════════════════════════════════════════════════════
 
   // ═══════════════════════════════════════════════════════════════
   // PUBLIC API
