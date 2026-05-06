@@ -1,0 +1,27 @@
+name: Purge jsDelivr cache
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tgpt/widgets/**'
+  workflow_dispatch:    # lets you re-run from the Actions tab manually
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Purge changed widget files on jsDelivr
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          # Purge the whole tgpt/widgets/ folder. Add files as you publish more.
+          for f in tgpt/widgets/chat.js tgpt/widgets/chatv2.js; do
+            url="https://purge.jsdelivr.net/gh/${REPO}@main/${f}"
+            echo "Purging: ${url}"
+            # -f fails on HTTP errors; jsDelivr returns 200 + JSON on success.
+            curl -fsSL "${url}" || echo "  (purge call returned non-zero — continuing)"
+            echo
+          done
