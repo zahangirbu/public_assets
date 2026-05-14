@@ -1,22 +1,16 @@
 /**
- * NEXUS Chat Widget v2
- * --------------------
- * Premium embeddable chat for the NEXUS Agent backend.
+ * NEXUS Chat Widget — nexus-auth edition
+ * --------------------------------------
+ * Authentication is handled exclusively by either:
+ *   - `allowNexusAuthLogin` — popup OIDC against the nexus-auth BFF
+ *     (postMessage delivers an agent-issued JWT to the widget).
+ *   - `allowToRetrieveFromApi` — silent host-API retrieval of
+ *     openid/email for the anonymous lite-chat path.
  *
- * Features:
- *   - Panel / sidebar / modal modes with drag-move + edge-resize
- *   - Markdown rendering (bold, italic, links, lists, code, headings)
- *   - Auto-linkified URLs + source citation chips
- *   - Typing indicator (animated dots) before first content
- *   - Message timestamps on hover
- *   - Copy-to-clipboard on assistant messages
- *   - Thumbs up/down feedback per message
- *   - Session persistence (survives page refresh)
- *   - ARIA accessibility (focus trap in modal, live region, labels)
- *   - Smooth slide-up open animation
- *   - BU branding (Whitney font, BU Red, sub-brand shield avatar)
- *   - MSAL / host-API / cookie auth strategies
- *   - SSE streaming with tool events
+ * Both strategies coexist with a single `authToken` page state: when a
+ * JWT is captured, /chat goes to /api/v1/chat with `Authorization:
+ * Bearer <jwt>`; otherwise it goes to /api/v1/lite-chat with optional
+ * `openid` / `email` body fields.
  *
  * Config via window.TerrierChatWidgetConfig BEFORE the script loads.
  */
@@ -28,10 +22,11 @@
   // ═══════════════════════════════════════════════════════════════
   const uc = (typeof window !== 'undefined' && window.TerrierChatWidgetConfig) || {};
   const C = Object.assign({
-    backendUrl: 'http://localhost:8080/api/v1/lite-chat',
-    // Endpoint for thumbs-up / thumbs-down feedback POSTs. When null,
-    // it is derived from the backendUrl base + '/api/v1/feedback'.
-    feedbackUrl: null,
+    // Single source of truth for the backend host. Every endpoint —
+    // chat, lite-chat, feedback, deployments, and nexus-auth /start —
+    // is composed as `apiBaseUrl + <constant path>`. Path constants
+    // live in the `// PATH CONSTANTS` block right after `STATE`.
+    apiBaseUrl: 'http://localhost:8080',
     title: 'TerrierGPT Lite',
     // Optional sub-line under the title in the header.
     subtitle: '',
@@ -53,16 +48,6 @@
     // (toggled from the header). `null` hides the info button.
     infoContent: null,
 
-    // --- Entra ID / openid options (ported from chat.js) ----------------
-    // Scan the host page at mount time for an existing Entra openid.
-    extractOpenidFromHost: true,
-    // On `auth_required`, enable MSAL silent sign-in (hidden iframe).
-    // Requires `msal.clientId` and `msal.authority`.
-    allowMsalFallback: true,
-    // On `auth_required`, allow an interactive MSAL popup login.
-    // Requires `msal.clientId` and `msal.authority`. When both silent
-    // and popup are enabled, silent is tried first.
-    allowMsalPopupLogin: true,
     // After a successful login (or host-API retrieval), automatically
     // re-send the last query.
     autoRetryAfterAuth: true,
@@ -74,6 +59,14 @@
     // when enabled.
     allowToRetrieveFromApi: false,
 
+    // --- Nexus-auth popup OIDC strategy --------------------------------
+    // When true, on `auth_required` the widget renders a "Sign in"
+    // link that opens the popup at `${apiBaseUrl}/api/v1/auth/start`.
+    // On success the widget captures the returned JWT (postMessage'd
+    // from the popup) and switches subsequent /api/v1/lite-chat calls
+    // to the Bearer-protected /api/v1/chat endpoint.
+    allowNexusAuthLogin: false,
+
     // --- Theming / runtime extras (v2-only) -----------------------------
     // Primary brand color used for the header, send button, links, and
     // citation chips. Any valid CSS color string.
@@ -81,9 +74,6 @@
     // When true, attempt to GET runtime config (provider/deployment/etc.)
     // from the backend at mount time so hosts don't have to hard-code it.
     autoFetchConfig: true,
-    // Override URL for the runtime-config endpoint. When null, it is
-    // derived from the backendUrl base.
-    configUrl: null,
     // Custom avatar URL for assistant bubbles. When null, falls back to
     // the embedded BU shield SVG.
     avatarUrl: null,
@@ -102,16 +92,6 @@
     system_message_id: null,
   }, (uc && uc.chatDefaults) || {});
 
-  // MSAL config, deep-merged so hosts can override only what they need.
-  C.msal = Object.assign({
-    clientId: null,
-    authority: null,
-    redirectUri: null,
-    scopes: ['openid', 'profile'],
-    loginHint: null,
-    scriptUrl: 'https://cdn.jsdelivr.net/npm/@azure/msal-browser@3.30.0/lib/msal-browser.min.js',
-  }, (uc && uc.msal) || {});
-
   // Host-API retrieval config.
   C.hostApi = Object.assign({
     endpoint: null,
@@ -124,12 +104,38 @@
     mapper: null,
   }, (uc && uc.hostApi) || {});
 
+  // Nexus-auth popup OIDC config (paired with `allowNexusAuthLogin`).
+  // host contract: the widget POSTs the user to
+  // `${apiBaseUrl}${AUTH_START_PATH}?return_origin=...&nonce=...` in a
+  // popup, and the popup posts back `{ type: 'nexus-auth', payload: {
+  // token, nonce } }` via window.postMessage. The path is a constant
+  // (see AUTH_START_PATH below) — not configurable, since the endpoint
+  // is owned by the agent backend.
+  C.nexusAuth = Object.assign({
+    // window.open features string for the popup.
+    popupFeatures: 'width=500,height=700',
+    // Optional extra query params appended to the start URL (passthrough).
+    extraParams: null,
+    // Set true to drop the conversation id when auth state changes — the
+    // anon convo lives under user_id="anonymous" on the agent side and
+    // continuing it as a signed-in user would cross identities.
+    resetConversationOnAuth: true,
+  }, (uc && uc.nexusAuth) || {});
+
   // ═══════════════════════════════════════════════════════════════
   // STATE
   // ═══════════════════════════════════════════════════════════════
   const WID = 'nx-chat', LID = 'nx-chat-launcher', SID = 'nx-chat-style';
   const STORE_KEY = 'nx_chat_convId';
   let convId = null, openid = null, oidSrc = null, email = null, lastQ = null;
+  // ── Nexus-auth state (active only when `allowNexusAuthLogin` = true) ──
+  // `authToken` is the JWT issued by nexus-auth; presence of a token
+  // routes /chat through `/api/v1/chat` with `Authorization: Bearer …`
+  // and suppresses sending openid/email in the request body. `authClaims`
+  // is the decoded payload (read-only — display only). `pendingAuth`
+  // tracks the in-flight popup promise so a superseding sign-in
+  // attempt can reject the prior one cleanly.
+  let authToken = null, authClaims = null, pendingAuth = null;
   let mode = 'panel', busy = false, widgetVisible = false;
   if (typeof document === 'undefined') return;
   if (document.getElementById(WID)) return;
@@ -143,7 +149,25 @@
   // Script base URL for font loading
   const scriptEl = document.currentScript || document.querySelector('script[src*="chat.js"]');
   const scriptBase = scriptEl ? scriptEl.src.replace(/\/[^/]*$/, '') : '.';
-  const apiBase = C.configUrl || C.backendUrl.replace(/\/api\/v1\/.*$/, '');
+
+  // ── PATH CONSTANTS ─────────────────────────────────────────
+  // Backend host comes from `C.apiBaseUrl`. Every endpoint is
+  // `C.apiBaseUrl + <PATH constant>` so there is exactly one place to
+  // configure the host. Trim a trailing slash defensively so
+  // `apiUrl(p)` never produces a double-slash in the middle.
+  const API_BASE = (C.apiBaseUrl || '').replace(/\/+$/, '');
+  const LITE_CHAT_PATH = '/api/v1/lite-chat';
+  const CHAT_PATH = '/api/v1/chat';
+  const DEPLOYMENTS_PATH = '/api/v1/deployments';
+  const FEEDBACK_PATH_PREFIX = '/api/v1/conversations/';   // + <conversationId> + '/feedback'
+  const AUTH_START_PATH = '/api/v1/auth/start';
+  const apiUrl = (path) => API_BASE + path;
+
+  // Origin of `apiBaseUrl`, used to validate `postMessage` events
+  // arriving from the nexus-auth popup. Computed once at boot.
+  const apiOrigin = (() => {
+    try { return new URL(API_BASE).origin; } catch (_) { return null; }
+  })();
 
   // Avatar image source — custom URL or BU shield fallback
   function getAvatarSrc() { return C.avatarUrl || BU_SHIELD; }
@@ -535,7 +559,7 @@
 
   // Auto-fetch deployment config from the agent backend
   if (C.autoFetchConfig && C.chatDefaults.deployment) {
-    fetch(apiBase + '/api/v1/deployments?deploy_type=web-widget')
+    fetch(apiUrl(DEPLOYMENTS_PATH + '?deploy_type=web-widget'))
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (!data || !data.deployments) return;
@@ -876,7 +900,7 @@
   // ═══════════════════════════════════════════════════════════════
   function submitFeedback(msgId, rating, comment) {
     if (!convId) return;
-    const url = C.feedbackUrl || (apiBase + '/api/v1/conversations/' + convId + '/feedback');
+    const url = apiUrl(FEEDBACK_PATH_PREFIX + convId + '/feedback');
     const body = { rating };
     if (comment) body.comment = comment;
     fetch(url, {
@@ -887,34 +911,177 @@
   }
 
   // ═══════════════════════════════════════════════════════════════
-  // AUTH (compact — all strategies from original)
+  // HOST-API RETRIEVAL STRATEGY  (allowToRetrieveFromApi)
   // ═══════════════════════════════════════════════════════════════
-  function isOid(v){if(typeof v!=='string')return false;const s=v.trim();if(s.length<8||s.length>8192)return false;if(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s))return true;if(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(s))return true;return s.length>=16&&!/\s/.test(s)}
-  function djwt(j){try{const p=String(j).split('.');if(p.length!==3)return null;const b=p[1].replace(/-/g,'+').replace(/_/g,'/');return JSON.parse(decodeURIComponent(atob(b).split('').map(c=>'%'+('00'+c.charCodeAt(0).toString(16)).slice(-2)).join('')))}catch(_){return null}}
-  function joid(j){const c=djwt(j);return c?(c.oid||c.sub||null):null}
-  function probeGlobals(){for(const n of['openid','__openid__','userOpenid','idToken','__idToken__']){const v=window[n];if(isOid(v))return{v,s:'g:'+n}}for(const n of['user','currentUser','authContext','msalAccount']){const o=window[n];if(o&&typeof o==='object'){const v=o.oid||o.openid||o.id_token||o.idToken||o.sub;if(isOid(v))return{v,s:'g:'+n}}}for(const n of['msalInstance','_msalInstance','__msal__']){const i=window[n];if(!i||typeof i.getAllAccounts!=='function')continue;try{for(const a2 of(i.getAllAccounts()||[])){const oid=a2.idTokenClaims&&(a2.idTokenClaims.oid||a2.idTokenClaims.sub);if(isOid(oid))return{v:oid,s:'msal:'+n};if(a2.idToken&&isOid(a2.idToken))return{v:joid(a2.idToken)||a2.idToken,s:'msal:'+n}}}catch(_){}}return null}
-  function probeStorage(st,lb){if(!st)return null;try{for(let i=0;i<st.length;i++){const k=st.key(i);if(!k)continue;const kl=k.toLowerCase();if(!(kl.includes('idtoken')||kl.startsWith('msal.')||kl.includes('login.windows.net')||kl.includes('login.microsoftonline.com')))continue;const r=st.getItem(k);if(!r)continue;try{const p=JSON.parse(r);if(p&&p.credentialType==='IdToken'&&isOid(p.secret))return{v:joid(p.secret)||p.secret,s:lb+':'+k};if(p&&(p.oid||p.openid)){const v2=p.oid||p.openid;if(isOid(v2))return{v:v2,s:lb+':'+k}}}catch(_){if(isOid(r))return{v:joid(r)||r,s:lb+':'+k}}}}catch(_){}return null}
-  function probeCookies(){if(!document.cookie)return null;for(const p of document.cookie.split(';').map(p2=>p2.trim())){const eq=p.indexOf('=');if(eq<0)continue;const n=p.slice(0,eq).toLowerCase(),v2=decodeURIComponent(p.slice(eq+1));if(['openid','id_token','idtoken','user_oid','auth_token'].includes(n)&&isOid(v2))return{v:joid(v2)||v2,s:'c:'+n}}return null}
-  function probeHost(){if(!C.extractOpenidFromHost)return;const f=probeGlobals()||probeStorage(window.localStorage,'ls')||probeStorage(window.sessionStorage,'ss')||probeCookies();if(f){openid=f.v;oidSrc=f.s}}
+  // Silent path: when enabled and an `auth_required` arrives, the
+  // widget GETs the host-supplied "who am I" endpoint and pulls
+  // openid / email out of the JSON. Populates the page state used
+  // by the lite-chat body fields (no Bearer token is produced).
   function rp(o,p){if(!p)return undefined;return p.split('.').reduce((a2,k)=>(a2!=null&&typeof a2==='object')?a2[k]:undefined,o)}
   function haEnabled(){return!!(C.allowToRetrieveFromApi&&C.hostApi&&C.hostApi.endpoint)}
   async function hostApiFetch(){if(!C.allowToRetrieveFromApi)return{ok:false};const api=C.hostApi||{};if(!api.endpoint)return{ok:false};let r;try{r=await fetch(api.endpoint,{method:api.method||'GET',credentials:api.credentials||'same-origin',headers:api.headers||undefined})}catch(e){return{ok:false,error:String(e)}}if(!r.ok)return{ok:false,error:'HTTP '+r.status};let d;try{d=await r.json()}catch(_){return{ok:false,error:'Bad JSON.'}}let oid2,em;if(typeof api.mapper==='function'){const m=api.mapper(d)||{};oid2=m.openid;em=m.email}else{oid2=rp(d,api.openidPath);em=rp(d,api.emailPath)}if(!oid2)return{ok:false,error:'No openid.'};openid=String(oid2).trim();oidSrc='host-api';if(em)email=String(em).trim();return{ok:true}}
-  let msP=null,msI=null;
-  function loadMs(){if(window.msal&&typeof window.msal.PublicClientApplication==='function')return Promise.resolve(window.msal);if(msP)return msP;msP=new Promise((r,j)=>{const s=document.createElement('script');s.src=C.msal.scriptUrl;s.async=true;s.onload=()=>window.msal?r(window.msal):j(new Error('!'));s.onerror=()=>j(new Error('msal load failed'));document.head.appendChild(s)});return msP}
-  async function getMs(){if(msI)return msI;const{clientId,authority,redirectUri}=C.msal;if(!clientId||!authority)throw new Error('MSAL not configured.');const m=await loadMs();msI=new m.PublicClientApplication({auth:{clientId,authority,redirectUri:redirectUri||window.location.origin},cache:{cacheLocation:'sessionStorage'}});if(typeof msI.initialize==='function')await msI.initialize();return msI}
-  async function silentAuth(){if(!C.allowMsalFallback)throw new Error('off');const i=await getMs();return exMs(await i.ssoSilent({scopes:C.msal.scopes,loginHint:C.msal.loginHint||undefined}),'msal:silent')}
-  async function popupAuth(){if(!C.allowMsalPopupLogin)throw new Error('off');const i=await getMs();return exMs(await i.loginPopup({scopes:C.msal.scopes}),'msal:popup')}
-  function exMs(r,src){const c2=(r&&r.idTokenClaims)||{},ac2=(r&&r.account)||{};const oid2=c2.oid||c2.sub||(r&&r.idToken?joid(r.idToken):null);const v2=oid2||(r&&r.idToken)||null;if(!v2)throw new Error('No oid.');openid=v2;oidSrc=src;email=c2.email||c2.preferred_username||c2.upn||ac2.username||null;return v2}
-  probeHost();
+
+  // ═══════════════════════════════════════════════════════════════
+  // NEXUS-AUTH POPUP OIDC STRATEGY
+  // ═══════════════════════════════════════════════════════════════
+  // When allowNexusAuthLogin: true, on `auth_required` the widget
+  // opens an OAuth popup at `${apiBaseUrl}/api/v1/auth/start`,
+  // listens for a `postMessage` carrying the JWT, and switches
+  // /api/v1/lite-chat calls to /api/v1/chat with `Authorization:
+  // Bearer <jwt>`.
+  function nxEnabled() { return !!(C.allowNexusAuthLogin && API_BASE); }
+
+  // Bearer-protected chat endpoint (used when an authToken is held).
+  function authedBackendUrl() { return apiUrl(CHAT_PATH); }
+
+  // Decode a JWT payload (no signature verification — display only).
+  function nxDecodeJwt(token) {
+    if (!token) return null;
+    const b64 = String(token).split('.')[1];
+    if (!b64) return null;
+    const s = b64.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = '==='.slice((s.length + 3) % 4);
+    return JSON.parse(decodeURIComponent(atob(s + pad).split('').map(c =>
+      '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)
+    ).join('')));
+  }
+
+  /**
+   * Open the nexus-auth popup and wait for postMessage. Returns a
+   * Promise that resolves with the captured JWT, or rejects if the
+   * popup is superseded by another sign-in attempt or is misconfigured.
+   *
+   * MUST be invoked synchronously inside a user gesture (e.g. click)
+   * because window.open(...) is the call popup blockers gate on. The
+   * `renderNexusAuth` button below preserves that gesture.
+   */
+  function nexusSignIn() {
+    return new Promise((resolve, reject) => {
+      if (!C.allowNexusAuthLogin) { reject(new Error('Nexus auth is disabled.')); return; }
+      if (!API_BASE)              { reject(new Error('apiBaseUrl is not configured.')); return; }
+
+      // Reject any prior in-flight popup — superseded by this new click.
+      if (pendingAuth) { try { pendingAuth.reject(new Error('superseded')); } catch (_) {} }
+
+      const nonce = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+        ? crypto.randomUUID()
+        : (Math.random().toString(36).slice(2) + Date.now().toString(36));
+      pendingAuth = { nonce, resolve, reject };
+
+      const params = new URLSearchParams({
+        return_origin: window.location.origin,
+        nonce,
+      });
+      if (C.nexusAuth.extraParams && typeof C.nexusAuth.extraParams === 'object') {
+        for (const k of Object.keys(C.nexusAuth.extraParams)) {
+          const v = C.nexusAuth.extraParams[k];
+          if (v != null) params.set(k, String(v));
+        }
+      }
+      // Always appended LAST so the host can't accidentally drop it via
+      // extraParams. Lets the auth BFF (/api/v1/auth/start on the agent)
+      // know which deployment the popup should sign in against — the
+      // same deployment slug the widget sends in /chat bodies.
+      const deploy = C.chatDefaults && C.chatDefaults.deployment;
+      if (typeof deploy === 'string' && deploy.trim()) {
+        params.set('deployment', deploy.trim());
+      }
+      const url = apiUrl(AUTH_START_PATH) + '?' + params.toString();
+      // window.open MUST be sync inside the click handler or popup
+      // blockers will eat it.
+      window.open(url, 'nexus-auth', C.nexusAuth.popupFeatures || 'width=500,height=700');
+    });
+  }
+
+  /**
+   * Clear in-memory nexus-auth state. There is no server-side session
+   * to revoke; refresh = signed out by design (token never persisted).
+   */
+  function nexusSignOut() {
+    authToken = null;
+    authClaims = null;
+    if (C.nexusAuth.resetConversationOnAuth) {
+      convId = null;
+      try { sessionStorage.removeItem(STORE_KEY); } catch (_) {}
+    }
+  }
+
+  // Install the postMessage listener exactly once. Three-layer envelope
+  // check: origin must match the apiBaseUrl's origin (the popup is
+  // served by the agent itself), type must be 'nexus-auth', and the
+  // payload's nonce must equal the in-flight pendingAuth.nonce.
+  // Anything else is silently ignored — the widget shares the global
+  // `message` event with everything else on the page.
+  if (typeof window !== 'undefined') {
+    window.addEventListener('message', (e) => {
+      if (!C.allowNexusAuthLogin) return;
+      if (!apiOrigin) return;
+      if (e.origin !== apiOrigin) return;
+      if (!e.data || e.data.type !== 'nexus-auth') return;
+      const p = e.data.payload || {};
+      if (!pendingAuth || p.nonce !== pendingAuth.nonce) return;
+
+      const tok = p.token || null;
+      authToken = tok;
+      try { authClaims = nxDecodeJwt(tok); } catch (_) { authClaims = {}; }
+      // Surface email from the JWT for chat.js's existing display paths
+      // (header avatar tooltip, etc.). Doesn't replace any host-supplied
+      // value if the claim is missing.
+      if (authClaims) {
+        const e2 = authClaims.email || authClaims.preferred_username || authClaims.upn;
+        if (e2) email = e2;
+      }
+      // Drop conversation_id on auth-state change so we don't continue an
+      // anonymous conversation under a now-known identity.
+      if (C.nexusAuth.resetConversationOnAuth) {
+        convId = null;
+        try { sessionStorage.removeItem(STORE_KEY); } catch (_) {}
+      }
+
+      const r = pendingAuth.resolve;
+      pendingAuth = null;
+      try { r(tok); } catch (_) {}
+    });
+  }
 
   // ═══════════════════════════════════════════════════════════════
   // SSE STREAMING
   // ═══════════════════════════════════════════════════════════════
-  function buildBody(msg){const b=Object.assign({},C.chatDefaults,{message:msg,conversation_id:convId,openid,email});for(const k of Object.keys(b)){if(b[k]==null||b[k]==='')delete b[k]}return b}
+  // Build the JSON body for /chat. When ANY strategy has produced a
+  // JWT into `authToken` (nexus-auth popup, MSAL silent, or MSAL popup),
+  // we deliberately omit `openid` / `email` — the agent verifies
+  // identity from the Bearer JWT instead, and forwarding unverified
+  // claims would be security theatre. The legacy host-API / host-page
+  // probing strategies (which populate `openid` / `email` directly)
+  // keep sending those fields as before since they don't produce a
+  // bearer token.
+  function buildBody(msg) {
+    const authed = !!authToken;
+    const b = Object.assign(
+      {},
+      C.chatDefaults,
+      authed
+        ? { message: msg, conversation_id: convId }
+        : { message: msg, conversation_id: convId, openid, email },
+    );
+    for (const k of Object.keys(b)) { if (b[k] == null || b[k] === '') delete b[k]; }
+    return b;
+  }
 
   async function sseStream(msg, H) {
+    // Endpoint + headers vary with auth state. Both URLs are derived
+    // from `apiBaseUrl` + a path constant — there's no per-endpoint
+    // configuration anywhere else in the file. Anonymous requests go
+    // to /api/v1/lite-chat; when we hold a JWT in `authToken` (from
+    // the nexus-auth popup) we switch to the Bearer-protected
+    // /api/v1/chat.
+    const authed = !!authToken;
+    const url = authed ? apiUrl(CHAT_PATH) : apiUrl(LITE_CHAT_PATH);
+    const headers = { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' };
+    if (authed) headers['Authorization'] = 'Bearer ' + authToken;
+
     let r;
-    try { r = await fetch(C.backendUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'text/event-stream' }, body: JSON.stringify(buildBody(msg)) }); }
+    try { r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(buildBody(msg)) }); }
     catch (e) { H.err(e); return; }
     if (!r.ok || !r.body) { let d = ''; try { d = ' \u2014 ' + (await r.text()); } catch (_) {} H.err(new Error('HTTP ' + r.status + d)); return; }
     const rd = r.body.getReader(), dc = new TextDecoder('utf-8'), SP = /\r?\n\r?\n/;
@@ -1015,13 +1182,27 @@
         // Mark as done so retry can proceed
         settled = true; busy = false; snb.disabled = false;
 
+        // Strategy precedence on `auth_required`:
+        //   1. host-API   — silent retrieval, no UI
+        //   2. nexus-auth — popup OIDC
+        // No third path: MSAL was removed in this fork. If neither
+        // strategy is configured, the auth bubble is left as a plain
+        // message — the host has misconfigured the widget.
         if (haEnabled()) { handleHostAuth(authEl, () => {}); return; }
-
-        // After successful auth, remove everything (auth msg + login button + preamble + user msg)
-        renderAuth(authEl, p, () => {
-          authEl.remove();
-          toRemove.forEach(el => { if (el && el.parentNode) el.remove(); });
-        });
+        if (nxEnabled()) {
+          renderNexusAuth(authEl, p, () => {
+            authEl.remove();
+            toRemove.forEach(el => { if (el && el.parentNode) el.remove(); });
+          });
+          return;
+        }
+        // No strategy configured — surface a hint inline so the host
+        // sees what's wrong.
+        const hint = document.createElement('span');
+        hint.className = 'nx-an';
+        hint.textContent = 'No sign-in strategy configured (set allowNexusAuthLogin or allowToRetrieveFromApi).';
+        authEl.appendChild(document.createElement('br'));
+        authEl.appendChild(hint);
       },
     });
   }
@@ -1033,29 +1214,56 @@
     else appTo(el, ' [error] ' + (r.error || 'failed'));
   }
 
-  function renderAuth(el, p, onAuthSuccess) {
-    const sOk = C.allowMsalFallback && C.msal.clientId && C.msal.authority;
-    const pOk = C.allowMsalPopupLogin && C.msal.clientId && C.msal.authority;
-    const lk = document.createElement('span'); lk.className = 'nx-al'; lk.setAttribute('role', 'button'); lk.textContent = p.label || 'Sign in with BU Login';
-    const nt = document.createElement('span'); nt.className = 'nx-an'; nt.textContent = sOk ? 'Will try silent first.' : pOk ? 'Opens a popup.' : 'MSAL not configured.';
-    el.appendChild(document.createElement('br')); el.appendChild(lk); el.appendChild(nt);
-    let ph = sOk && pOk ? 'sf' : sOk ? 'so' : pOk ? 'po' : 'x';
-    function afterLogin() { if (onAuthSuccess) onAuthSuccess(); if (C.autoRetryAfterAuth && lastQ) setTimeout(() => sendMsg(lastQ), 150); }
+  /**
+   * Render the auth bubble UI for the nexus-auth strategy. Mirrors the
+   * shape of `renderAuth` (uses the same `nx-al` / `nx-an` / `nx-bsy`
+   * classes) but dispatches to `nexusSignIn()` instead of MSAL. Only
+   * called when `nxEnabled()` returns true.
+   *
+   * The click handler runs `window.open(...)` synchronously so popup
+   * blockers don't interfere; the postMessage listener installed at
+   * boot resolves the returned promise on success.
+   */
+  function renderNexusAuth(el, p, onAuthSuccess) {
+    const lk = document.createElement('span');
+    lk.className = 'nx-al';
+    lk.setAttribute('role', 'button');
+    lk.setAttribute('tabindex', '0');
+    lk.textContent = p.label || 'Sign in';
+
+    const nt = document.createElement('span');
+    nt.className = 'nx-an';
+    nt.textContent = 'Opens a popup to sign you in.';
+
+    el.appendChild(document.createElement('br'));
+    el.appendChild(lk);
+    el.appendChild(nt);
+
+    function afterLogin() {
+      if (onAuthSuccess) { try { onAuthSuccess(); } catch (_) {} }
+      if (C.autoRetryAfterAuth && lastQ) setTimeout(() => sendMsg(lastQ), 150);
+    }
+
     const go = async () => {
       if (lk.classList.contains('nx-bsy')) return;
       lk.classList.add('nx-bsy');
-      if (ph === 'sf' || ph === 'so') {
-        lk.textContent = 'Signing in\u2026';
-        try { await silentAuth(); lk.textContent = 'Signed in \u2713'; afterLogin(); return; }
-        catch (_) { if (ph === 'sf') { ph = 'po'; lk.classList.remove('nx-bsy'); lk.textContent = 'Sign in with BU Login'; nt.textContent = 'Silent failed. Click for popup.'; return; } lk.classList.remove('nx-bsy'); lk.textContent = 'Retry'; return; }
-      }
-      if (ph === 'po') {
-        lk.textContent = 'Opening\u2026';
-        try { await popupAuth(); lk.textContent = 'Signed in \u2713'; afterLogin(); }
-        catch (e) { lk.classList.remove('nx-bsy'); lk.textContent = 'Sign in with BU Login'; nt.textContent = 'Failed: ' + (e.message || e); }
+      lk.textContent = 'Opening…';
+      try {
+        await nexusSignIn();
+        lk.textContent = 'Signed in ✓';
+        afterLogin();
+      } catch (e) {
+        lk.classList.remove('nx-bsy');
+        lk.textContent = p.label || 'Sign in';
+        // 'superseded' fires when the user clicked twice; keep silent.
+        const m = (e && e.message) ? e.message : String(e);
+        if (m !== 'superseded') nt.textContent = 'Failed: ' + m;
       }
     };
     lk.addEventListener('click', go);
+    lk.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); go(); }
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -1079,8 +1287,7 @@
   // button reuses chat.js's existing `.nx-mic` styles plus three additive
   // state classes: `.nx-mic-loading` (model download), `.nx-mic-on` (live
   // recording — same red pulse the input row already uses), and
-  // `.nx-mic-busy` (transcribing). No david-style emoji or class names —
-  // the SVG icon defined in `ic.mic` stays put.
+  // `.nx-mic-busy` (transcribing).
   //
   // Browsers without `MediaRecorder` / `getUserMedia` (rare today) get the
   // mic hidden via the existing `.nx-mic-hide` class.
@@ -1349,15 +1556,17 @@
     get mounted() { return true },
     get conversationId() { return convId },
     get mode() { return mode },
-    getOpenid() { return openid },
-    getOpenidSource() { return oidSrc },
+    // Email display (set by nexus-auth claims, host-API mapping, or
+    // explicit setEmail() from the host).
     getEmail() { return email },
-    setOpenid(v, o) { if (!v) { openid = null; oidSrc = null; email = null; return; } openid = v; if (o && typeof o === 'object') { oidSrc = o.source || 'host'; if (o.email) email = o.email; } else oidSrc = o || 'host'; },
     setEmail(e2) { email = e2 || null; },
-    refreshOpenidFromHost() { probeHost(); return openid; },
-    signInSilent: silentAuth,
-    signInPopup: popupAuth,
-    async signIn() { if (C.allowMsalFallback && C.msal.clientId) { try { return await silentAuth(); } catch (_) {} } return popupAuth(); },
+    // Nexus-auth strategy (popup OIDC; switches /chat from
+    // /api/v1/lite-chat to /api/v1/chat when a token is captured).
+    // Active only when `allowNexusAuthLogin` is true.
+    signInNexus: nexusSignIn,
+    signOutNexus: nexusSignOut,
+    getAuthToken() { return authToken; },
+    getAuthClaims() { return authClaims; },
   };
   try { window.dispatchEvent(new CustomEvent('terrier-chat-v2-ready')); } catch (_) {}
 })();
