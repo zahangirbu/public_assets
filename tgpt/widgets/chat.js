@@ -27,7 +27,8 @@
     // chat, lite-chat, feedback, deployments, and nexus-auth /start —
     // is composed as `apiBaseUrl + <constant path>`. Path constants
     // live in the `// PATH CONSTANTS` block right after `STATE`.
-    apiBaseUrl: 'http://localhost:8080',
+    // apiBaseUrl: 'http://localhost:8080',
+    apiBaseUrl: 'https://nexus-agent.ai-eks-nonprod.bu.edu',
     title: 'TerrierGPT Lite',
     // Optional sub-line under the title in the header.
     subtitle: '',
@@ -66,7 +67,7 @@
     // On success the widget captures the returned JWT (postMessage'd
     // from the popup) and switches subsequent /api/v1/lite-chat calls
     // to the Bearer-protected /api/v1/chat endpoint.
-    allowNexusAuthLogin: false,
+    allowNexusAuthLogin: true,
 
     // --- Theming / runtime extras (v2-only) -----------------------------
     // Primary brand color used for the header, send button, links, and
