@@ -1,6 +1,7 @@
 /**
- * NEXUS Chat Widget — nexus-auth edition
- * --------------------------------------
+ * NEXUS Chat Widget — nexus-auth edition + faster-whisper
+ * backend based voice transcription
+ * -------------------------------------------------------
  * Authentication is handled exclusively by either:
  *   - `allowNexusAuthLogin` — popup OIDC against the nexus-auth BFF
  *     (postMessage delivers an agent-issued JWT to the widget).
@@ -411,7 +412,7 @@
 #${WID} .nx-ia{display:flex;align-items:flex-end;gap:8px;padding:10px 12px;border-top:1px solid #eee;background:#fff;flex-shrink:0}
 #${WID} .nx-in-wrap{flex:1;display:flex;align-items:flex-end;border:1px solid #ddd;border-radius:12px;background:#fff;transition:border-color .15s,box-shadow .15s}
 #${WID} .nx-in-wrap:focus-within{border-color:${ac};box-shadow:0 0 0 2px ${ac}22}
-#${WID} .nx-mic{background:none;border:none;cursor:pointer;padding:8px 4px 8px 10px;color:#767676;display:flex;align-items:center;flex-shrink:0;transition:color .15s}
+#${WID} .nx-mic{background:none;border:none;cursor:pointer;padding:14px 4px 14px 10px;color:#767676;display:flex;align-items:center;flex-shrink:0;transition:color .15s}
 #${WID} .nx-mic:hover{color:#2D2926}
 #${WID} .nx-mic:disabled{cursor:not-allowed;opacity:.4}
 #${WID} .nx-mic:disabled:hover{color:#767676}
@@ -420,7 +421,7 @@
 #${WID} .nx-mic.nx-mic-busy{cursor:wait;color:${ac};opacity:.7}
 #${WID} .nx-mic svg{width:16px;height:16px}
 #${WID} .nx-mic.nx-mic-hide{display:none}
-#${WID} .nx-in{flex:1;resize:none;border:none;border-radius:0;padding:10px 14px 10px 4px;font-family:inherit;font-size:14px;height:44px;max-height:120px;outline:none;box-sizing:border-box;background:transparent}
+#${WID} .nx-in{flex:1;resize:none;border:none;border-radius:0;padding:13px 14px 7px 4px;font-family:inherit;font-size:14px;height:44px;max-height:120px;outline:none;box-sizing:border-box;background:transparent}
 #${WID} .nx-sn{width:36px;height:36px;border-radius:50%;border:none;background:${ac};color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:opacity .15s}
 #${WID} .nx-sn:disabled{opacity:.4;cursor:not-allowed}
 #${WID} .nx-sn svg{width:16px;height:16px;fill:currentColor}
@@ -506,8 +507,10 @@
     <div class="nx-ia">
       <div class="nx-in-wrap">
         <!-- Voice dictation button. Wired up by the VOICE INPUT block
-             below (transformers.js + Whisper). Hidden automatically on
-             browsers without MediaRecorder/getUserMedia. -->
+             below (POSTs the recorded blob to
+             /api/v1/voice/transcribe on the agent backend). Hidden
+             automatically on browsers without
+             MediaRecorder/getUserMedia. -->
         <button type="button" class="nx-mic" title="Voice input" aria-label="Voice input">${ic.mic}</button>
         <textarea class="nx-in" id="nx-chat-input" name="nx-chat-input" rows="1" placeholder="${esc(C.placeholder)}" aria-label="Chat message input" autocomplete="off"></textarea>
       </div>
@@ -1275,22 +1278,23 @@
   if (launcher) launcher.addEventListener('click', toggle);
 
   // ═══════════════════════════════════════════════════════════════
-  // VOICE INPUT — transformers.js + Xenova/whisper-base.en (in-browser)
+  // VOICE INPUT — POST audio blob to /api/v1/voice/transcribe (faster-whisper)
   // ═══════════════════════════════════════════════════════════════
-  // Hold-to-talk dictation. The model (~150 MB of ONNX weights) is fetched
-  // from the HF CDN on first use and cached in IndexedDB by transformers.js;
-  // no audio leaves the browser. Inference runs on WebGPU when available
-  // and falls back to WASM.
+  // Hold-to-talk dictation. The widget records an audio blob via the
+  // browser's MediaRecorder API, POSTs it as multipart/form-data to
+  // the agent's /api/v1/voice/transcribe endpoint, and inserts the
+  // returned transcript into the input. Whisper inference runs on the
+  // server (faster-whisper); the browser does NO model loading.
   //
-  // UX: press-and-hold the mic to record, release to transcribe + auto-send
-  // (the gesture implies commitment — the user kept their finger down). The
-  // button reuses chat.js's existing `.nx-mic` styles plus three additive
-  // state classes: `.nx-mic-loading` (model download), `.nx-mic-on` (live
-  // recording — same red pulse the input row already uses), and
-  // `.nx-mic-busy` (transcribing).
+  // UX: press-and-hold the mic to record, release to transcribe + auto
+  // -send (the gesture implies commitment — the user kept their finger
+  // down). The button reuses chat.js's existing `.nx-mic` styles plus
+  // three additive state classes: `.nx-mic-loading` is unused (no
+  // model download anymore), `.nx-mic-on` (live recording — red pulse),
+  // and `.nx-mic-busy` (server transcription in flight).
   //
-  // Browsers without `MediaRecorder` / `getUserMedia` (rare today) get the
-  // mic hidden via the existing `.nx-mic-hide` class.
+  // Browsers without `MediaRecorder` / `getUserMedia` get the mic
+  // hidden via the existing `.nx-mic-hide` class.
   const micBtn = root.querySelector('.nx-mic');
 
   if (!micBtn) {
@@ -1298,15 +1302,18 @@
   } else if (!navigator.mediaDevices || !window.MediaRecorder) {
     micBtn.classList.add('nx-mic-hide');
   } else {
-    const VOICE_MODEL = 'Xenova/whisper-base.en';
-    const VOICE_LIB   = 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js';
+    // Path of the transcription endpoint on the same host as the chat
+    // backend. chat.js exposes `apiBase` (the backendUrl trimmed of
+    // its /api/v1/* tail) earlier in the file, so we just append the
+    // voice path here.
+    const TRANSCRIBE_URL = API_BASE + '/api/v1/voice/transcribe';
 
     // ── State ────────────────────────────────────────────────
     // `recording` = MediaRecorder is active.
     // `pressHeld` = the user's pointer is currently down on the button.
-    // We track them separately so a release during the async getUserMedia
-    // permission prompt cancels cleanly instead of leaving an orphan stream.
-    let transcriber = null;
+    // We track them separately so a release during the async
+    // getUserMedia permission prompt cancels cleanly instead of
+    // leaving an orphan stream.
     let recording = false;
     let pressHeld = false;
     let mediaStream = null;
@@ -1314,21 +1321,18 @@
     let recordedChunks = [];
 
     // Stable "home" for the input placeholder. onRecordingStop restores
-    // to this — never to a transient value (e.g. "Transcribing…")
-    // that a fast second press might capture.
+    // to this — never to a transient value (e.g. "Transcribing…") that
+    // a fast second press might capture.
     let basePlaceholder = C.placeholder || '';
     inp.placeholder = basePlaceholder;
-
-    // Original mic title for restore (chat.js's existing `Voice input`).
     const baseTitle = micBtn.getAttribute('title') || 'Voice input';
 
     /**
      * Mic button state machine. All state classes flow through here so
-     * transitions are atomic — no chance of `nx-mic-on` and `nx-mic-busy`
-     * coexisting on a race. Only the additive nx-mic-* classes are
-     * touched; `.nx-mic` itself and the SVG icon are preserved.
+     * transitions are atomic — no chance of `nx-mic-on` and
+     * `nx-mic-busy` coexisting on a race.
      *
-     * @param {'idle'|'loading'|'listening'|'busy'|'error'|'unavailable'} state
+     * @param {'idle'|'listening'|'busy'|'error'|'unavailable'} state
      * @param {string} [title] tooltip override
      */
     function setMicState(state, title) {
@@ -1336,11 +1340,6 @@
       let disabled = false;
       let resolvedTitle = title;
       switch (state) {
-        case 'loading':
-          micBtn.classList.add('nx-mic-loading');
-          disabled = true;
-          if (resolvedTitle === undefined) resolvedTitle = 'Loading voice model…';
-          break;
         case 'listening':
           micBtn.classList.add('nx-mic-on');
           if (resolvedTitle === undefined) resolvedTitle = 'Listening — release to send';
@@ -1367,76 +1366,13 @@
       micBtn.setAttribute('title', resolvedTitle || baseTitle);
       micBtn.setAttribute('aria-label', resolvedTitle || baseTitle);
     }
-
-    /**
-     * Lazily pulls the transformers.js ESM bundle and instantiates the
-     * Whisper pipeline. Called once at startup. While the download runs
-     * the mic button stays in `loading` state and shows rough overall
-     * progress in its tooltip.
-     * @returns {Promise<void>}
-     */
-    async function loadVoiceModel() {
-      try {
-        setMicState('loading');
-        // Use the package's prebuilt ESM bundle. jsdelivr's `+esm` auto-
-        // transform rewrites imports in a way that breaks onnxruntime-web's
-        // backend registration (null.registerBackend) — go direct.
-        const { pipeline, env } = await import(VOICE_LIB);
-        env.allowLocalModels = false;   // hit HF CDN; rely on IndexedDB cache
-        // Aggregate per-file download progress into a single percentage.
-        const fileProgress = {};
-        const onProgress = (p) => {
-          if (p.status === 'progress' && p.file) {
-            fileProgress[p.file] = p.progress || 0;
-            const vals = Object.values(fileProgress);
-            const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-            setMicState('loading', 'Loading voice model… ' + Math.round(avg) + '%');
-          } else if (p.status === 'done') {
-            setMicState('loading', 'Loading voice model… finalizing');
-          }
-        };
-        transcriber = await pipeline(
-          'automatic-speech-recognition',
-          VOICE_MODEL,
-          { progress_callback: onProgress }
-        );
-        setMicState('idle');
-        try { console.log('[voice] model ready'); } catch (_) {}
-      } catch (err) {
-        try { console.error('[voice] model load failed:', err); } catch (_) {}
-        setMicState('error', 'Voice input unavailable (model failed to load)');
-      }
-    }
-
-    /**
-     * Decode the MediaRecorder blob, downmix to mono, resample to 16 kHz —
-     * the exact shape Whisper expects.
-     * @param {Blob} blob
-     * @returns {Promise<Float32Array>}
-     */
-    async function blobToFloat32_16kMono(blob) {
-      const arrayBuf = await blob.arrayBuffer();
-      const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const decoded = await tmpCtx.decodeAudioData(arrayBuf);
-      tmpCtx.close();
-
-      const target = 16000;
-      const offline = new OfflineAudioContext(
-        1,
-        Math.ceil(decoded.duration * target),
-        target
-      );
-      const src = offline.createBufferSource();
-      src.buffer = decoded;
-      src.connect(offline.destination);
-      src.start();
-      const rendered = await offline.startRendering();
-      return rendered.getChannelData(0);
-    }
+    // Voice is ready as soon as the mic permission can be requested —
+    // there is no model download step on the client.
+    setMicState('idle');
 
     /** Request mic permission and start a MediaRecorder session. */
     async function startRecording() {
-      if (!transcriber || recording) return;
+      if (recording) return;
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1474,29 +1410,138 @@
     }
 
     /**
-     * MediaRecorder `stop` handler. Assembles captured chunks, runs Whisper
-     * over them, and inserts the transcript into the input. Hold-to-talk
-     * implies intent, so we auto-submit on success.
+     * MediaRecorder `stop` handler. POSTs the captured blob to the
+     * backend `/api/v1/voice/transcribe` endpoint, then consumes the
+     * SSE response stream: each `segment` event appends its text to
+     * the input as soon as faster-whisper decodes it. On `end`,
+     * auto-submits the accumulated message — hold-to-talk implies
+     * intent, so we don't wait for the user to press Send.
+     *
+     * SSE event shapes (defined by `routers/voice.py`):
+     *   event: start    data: {"language": "...", "duration": ...}
+     *   event: segment  data: {"text": "...", "start": ..., "end": ...}
+     *   event: end      data: {}
+     *   event: error    data: {"message": "..."}
      */
     async function onRecordingStop() {
       inp.placeholder = 'Transcribing…';
+
+      // Snapshot whatever the user had typed BEFORE recording so we
+      // can append (not overwrite) the streamed transcript. Strip
+      // trailing whitespace so the join below is consistent.
+      const initialValue = inp.value.replace(/\s+$/, '');
+      let accumulated = '';        // running transcript across segments
+      let streamErrored = false;
+
+      // Update `inp.value` from `initialValue` + the running accumulator
+      // and re-run chat.js's auto-resize math.
+      const renderTranscript = () => {
+        const joined = initialValue
+          ? initialValue + (accumulated ? ' ' + accumulated : '')
+          : accumulated;
+        inp.value = joined;
+        inp.style.height = '44px';
+        inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
+      };
+
       try {
-        const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType });
-        if (blob.size >= 500) { // anything smaller is silence / no audio captured
-          const audio = await blobToFloat32_16kMono(blob);
-          const result = await transcriber(audio);
-          const text = (result && result.text ? result.text : '').trim();
-          if (text) {
-            inp.value = inp.value ? inp.value + ' ' + text : text;
-            // Match chat.js's input auto-resize behaviour after programmatic value change.
-            inp.style.height = '44px';
-            inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
-            inp.focus();
-            // Hold-to-talk implies commitment — auto-send on release.
-            sendMsg();
+        const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        if (blob.size < 500) {
+          // Anything smaller is silence / no audio captured.
+          inp.placeholder = basePlaceholder;
+          return;
+        }
+
+        const form = new FormData();
+        // Filename is required by some servers (Werkzeug, multer) for
+        // multipart parsing to populate `filename`. FastAPI/Starlette
+        // don't need it but the server log is friendlier with one.
+        const ext = (blob.type.includes('ogg') ? '.ogg'
+                  : blob.type.includes('mp4') ? '.m4a'
+                  : blob.type.includes('wav') ? '.wav'
+                  :                              '.webm');
+        form.append('audio', blob, 'recording' + ext);
+
+        const headers = { 'Accept': 'text/event-stream' };
+        // Forward the agent JWT when we have one (chat.js's nexus-auth
+        // strategy populates `authToken`). The /transcribe endpoint
+        // uses `optional_auth`, so anonymous calls work too.
+        if (typeof authToken === 'string' && authToken) {
+          headers['Authorization'] = 'Bearer ' + authToken;
+        }
+
+        const resp = await fetch(TRANSCRIBE_URL, {
+          method: 'POST',
+          headers,
+          body: form,
+        });
+        if (!resp.ok || !resp.body) {
+          let detail = '';
+          try { detail = ' — ' + (await resp.text()); } catch (_) {}
+          throw new Error('HTTP ' + resp.status + detail);
+        }
+
+        // ── SSE consumer ───────────────────────────────────────
+        // Identical pattern to chat.js's main `sseStream`: read the
+        // body as a stream, split on blank lines, parse event/data.
+        // Tolerant of both LF and CRLF line endings (sse-starlette
+        // uses CRLF).
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        const BLOCK_SEP = /\r?\n\r?\n/;
+        let buffer = '';
+
+        // Tracks whether ANY segment text has landed yet, so we know
+        // whether to auto-send at the end.
+        let gotAnyText = false;
+
+        const handleEvent = (raw) => {
+          let eventName = 'message';
+          let dataStr = '';
+          for (const line of raw.split(/\r?\n/)) {
+            if (line.startsWith('event:')) {
+              eventName = line.slice(6).trim();
+            } else if (line.startsWith('data:')) {
+              const chunk = line.slice(5);
+              dataStr += chunk.startsWith(' ') ? chunk.slice(1) : chunk;
+            }
+          }
+          if (!dataStr && eventName !== 'end') return;
+          let data = {};
+          try { data = JSON.parse(dataStr); } catch (_) { data = {}; }
+
+          if (eventName === 'segment') {
+            const t = typeof data.text === 'string' ? data.text.trim() : '';
+            if (t) {
+              accumulated += (accumulated ? ' ' : '') + t;
+              gotAnyText = true;
+              renderTranscript();
+            }
+          } else if (eventName === 'error') {
+            streamErrored = true;
+            throw new Error(data.message || 'transcription error');
+          }
+          // `start` and `end` are informational — no UI work needed.
+        };
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let m;
+          while ((m = BLOCK_SEP.exec(buffer)) !== null) {
+            handleEvent(buffer.slice(0, m.index));
+            buffer = buffer.slice(m.index + m[0].length);
           }
         }
+        if (buffer.trim()) handleEvent(buffer);
+
         inp.placeholder = basePlaceholder;
+        if (!streamErrored && gotAnyText) {
+          inp.focus();
+          // Hold-to-talk implies commitment — auto-send on stream end.
+          sendMsg();
+        }
       } catch (err) {
         try { console.error('[voice] transcription failed:', err); } catch (_) {}
         inp.placeholder = 'Voice transcription failed';
@@ -1523,8 +1568,8 @@
       if (!pressHeld) return;
       e.preventDefault();
       pressHeld = false;
-      // If startRecording is still mid-permission-prompt, the `pressHeld`
-      // check inside it abandons the stream cleanly.
+      // If startRecording is still mid-permission-prompt, the
+      // `pressHeld` check inside it abandons the stream cleanly.
       if (recording) stopRecording();
     };
     micBtn.addEventListener('mousedown', pressStart);
@@ -1533,10 +1578,6 @@
     micBtn.addEventListener('mouseleave', pressEnd);
     micBtn.addEventListener('touchend', pressEnd);
     micBtn.addEventListener('touchcancel', pressEnd);
-
-    // Eagerly start the model download so most of the ~150 MB transfer
-    // happens in the background while the user is still reading the page.
-    loadVoiceModel();
   }
   // ═══════════════════════════════════════════════════════════════
   // END VOICE INPUT
